@@ -402,8 +402,7 @@ async function dispatchAction(action, params, profile) {
 
     // JavaScript evaluation
     case "evaluate":
-      if (params?.pageWorld) return evaluateInMainWorld(params);
-      return sendToContent("evaluate", params, profile);
+      return evaluateInMainWorld(params);
 
     // Scrolling
     case "scroll":
