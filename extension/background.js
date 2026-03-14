@@ -142,7 +142,7 @@ function updateBadge() {
     chrome.action.setTitle({ title: "Browser Agent Bridge - Disconnected" });
   } else {
     chrome.action.setBadgeText({ text: "" });
-    chrome.action.setTitle({ title: "Browser Agent Bridge - Idle" });
+    chrome.action.setTitle({ title: "Chrome Agent Bridge - Idle" });
   }
   broadcastStatus();
 }

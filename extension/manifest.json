@@ -16,7 +16,6 @@
     "notifications",
     "storage",
     "webNavigation",
-    "webRequest",
     "downloads",
     "scripting"
   ],
