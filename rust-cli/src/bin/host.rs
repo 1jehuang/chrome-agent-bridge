@@ -1,0 +1,1213 @@
+//! Native messaging host for Chrome Agent Bridge
+//!
+//! This binary replaces the Node.js host.js. It:
+//! 1. Runs a WebSocket server on ws://127.0.0.1:8766
+//! 2. Communicates with Chrome via native messaging (stdin/stdout)
+//! 3. Routes messages between WebSocket clients and the browser extension
+
+use std::collections::HashMap;
+use std::env;
+use std::io::{self, Read, Write as IoWrite};
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Session state for a WebSocket client connection.
+/// Each connection gets its own session with an isolated active tab.
+struct ClientSession {
+    id: String,
+    active_tab_id: Option<i64>,
+    forks: HashMap<String, i64>, // fork_name -> tabId
+}
+
+use bronzewarden::api::{BitwardenApi, SyncResponse};
+use bronzewarden::config::Config as BwConfig;
+use bronzewarden::crypto::{EncString, MasterKey};
+use bronzewarden::vault::Vault;
+
+use base64::Engine;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use tokio::net::TcpListener;
+use tokio::process::Command;
+use tokio::sync::{mpsc, RwLock};
+use tokio::time::timeout;
+use tokio_tungstenite::accept_async_with_config;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::Message;
+
+/// Environment variable configuration
+fn ws_host() -> String {
+    env::var("FAB_WS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+fn ws_port() -> u16 {
+    env::var("FAB_WS_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8766)
+}
+
+fn request_timeout_ms() -> u64 {
+    env::var("FAB_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30000)
+}
+
+fn autologin_require_fingerprint() -> bool {
+    env::var("FAB_AUTOLOGIN_REQUIRE_FINGERPRINT")
+        .ok()
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(true)
+}
+
+fn fingerprint_timeout_ms() -> u64 {
+    env::var("FAB_FINGERPRINT_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20000)
+}
+
+async fn verify_fingerprint(reason: &str, detail: &str) -> Result<(), String> {
+    let user = env::var("USER").map_err(|_| "USER env var is not set for fingerprint verification.")?;
+
+    let body = if detail.is_empty() {
+        format!("{}\nTouch the fingerprint sensor to continue.", reason)
+    } else {
+        format!("{}\n{}\nTouch the fingerprint sensor to continue.", reason, detail)
+    };
+
+    let _ = Command::new("notify-send")
+        .args(["-i", "fingerprint", "-a", "Chrome Agent Bridge",
+               "-u", "normal", "-t", "20000",
+               "🔐 Fingerprint Required", &body])
+        .spawn();
+
+    let mut cmd = Command::new("fprintd-verify");
+    cmd.arg(&user)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let output = timeout(Duration::from_millis(fingerprint_timeout_ms()), cmd.output())
+        .await
+        .map_err(|_| {
+            let _ = Command::new("notify-send")
+                .args(["-i", "dialog-error", "-a", "Chrome Agent Bridge",
+                       "-u", "normal", "-t", "5000",
+                       "❌ Fingerprint Timed Out", "Auto-fill was cancelled."])
+                .spawn();
+            "Fingerprint verification timed out. Touch the enrolled fingerprint sensor and try again.".to_string()
+        })?
+        .map_err(|e: std::io::Error| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "fprintd-verify not found. Install fprintd to use fingerprint auth.".to_string()
+            } else {
+                format!("Failed to run fprintd-verify: {}", e)
+            }
+        })?;
+
+    if output.status.success() {
+        let _ = Command::new("notify-send")
+            .args(["-i", "dialog-ok", "-a", "Chrome Agent Bridge",
+                   "-u", "low", "-t", "3000",
+                   "✅ Fingerprint Verified", reason])
+            .spawn();
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let fail_detail = stderr.trim().split('\n').rev().find(|l| !l.trim().is_empty())
+        .or_else(|| stdout.trim().split('\n').rev().find(|l| !l.trim().is_empty()))
+        .unwrap_or("verification failed");
+
+    let _ = Command::new("notify-send")
+        .args(["-i", "dialog-error", "-a", "Chrome Agent Bridge",
+               "-u", "normal", "-t", "5000",
+               "❌ Fingerprint Failed", &format!("Auto-fill denied: {}", fail_detail)])
+        .spawn();
+
+    Err(format!("Fingerprint verification failed: {}", fail_detail))
+}
+
+/// Log to stderr (native messaging uses stdout for messages)
+macro_rules! log {
+    ($($arg:tt)*) => {
+        eprintln!("[chrome-agent-bridge] {}", format!($($arg)*));
+    };
+}
+
+/// Request counter for generating unique IDs
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_id() -> String {
+    let count = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("req_{}_{}", now, count)
+}
+
+/// Pending request tracking
+struct PendingRequest {
+    response_tx: mpsc::Sender<Value>,
+    started: Instant,
+    profile: bool,
+}
+
+type PendingMap = Arc<RwLock<HashMap<String, PendingRequest>>>;
+
+/// Channel for sending messages to native messaging (stdout)
+type NativeTx = mpsc::Sender<Value>;
+
+/// Get MIME type from file extension
+fn get_mime_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).as_deref() {
+        Some("zip") => "application/zip",
+        Some("xpi") => "application/x-xpinstall",
+        Some("json") => "application/json",
+        Some("js") => "application/javascript",
+        Some("html") | Some("htm") => "text/html",
+        Some("css") => "text/css",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Process uploadFile action - read file and convert to fillForm with base64 data
+/// Max base64 data size per native messaging message (~750KB to stay under Chrome's 1MB limit)
+const CHUNK_SIZE: usize = 750_000;
+
+fn process_upload_file(message: &mut Value) -> Result<(), String> {
+    let params = message.get_mut("params").ok_or("Missing params")?;
+    let file_path = params.get("filePath")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing filePath")?
+        .to_string();
+    let selector = params.get("selector")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing selector")?
+        .to_string();
+
+    let path = Path::new(&file_path);
+    let file_data = std::fs::read(path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&file_data);
+    let file_name = path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let mime_type = get_mime_type(path);
+
+    // Convert to fillForm action
+    message["action"] = json!("fillForm");
+    message["params"] = json!({
+        "fields": [{
+            "selector": selector,
+            "file": {
+                "name": file_name,
+                "type": mime_type,
+                "data": base64_data
+            }
+        }]
+    });
+
+    Ok(())
+}
+
+/// Check if a message payload is too large for native messaging and needs chunking
+fn needs_chunking(message: &Value) -> bool {
+    let serialized = message.to_string();
+    serialized.len() > CHUNK_SIZE
+}
+
+/// Send a large message in chunks via native messaging, then send the action with a reassembly reference
+async fn send_chunked_file(
+    message: &mut Value,
+    native_tx: &NativeTx,
+) -> Result<(), String> {
+    let id = message.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let action = message.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    // Extract file data from the message (works for fillForm and dropFile)
+    let (base64_data, file_name, mime_type, selector) = if action == "fillForm" {
+        let fields = message.get("params")
+            .and_then(|p| p.get("fields"))
+            .and_then(|f| f.as_array())
+            .ok_or("Missing fields")?;
+        let field = fields.first().ok_or("Empty fields")?;
+        let file = field.get("file").ok_or("No file in field")?;
+        let data = file.get("data").and_then(|v| v.as_str()).ok_or("No data")?.to_string();
+        let name = file.get("name").and_then(|v| v.as_str()).unwrap_or("file").to_string();
+        let mime = file.get("type").and_then(|v| v.as_str()).unwrap_or("application/octet-stream").to_string();
+        let sel = field.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        (data, name, mime, sel)
+    } else if action == "dropFile" {
+        let params = message.get("params").ok_or("Missing params")?;
+        let data = params.get("data").and_then(|v| v.as_str()).ok_or("No data")?.to_string();
+        let name = params.get("fileName").and_then(|v| v.as_str()).unwrap_or("file").to_string();
+        let mime = params.get("mimeType").and_then(|v| v.as_str()).unwrap_or("application/octet-stream").to_string();
+        let sel = params.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        (data, name, mime, sel)
+    } else {
+        return Err("Unsupported chunked action".to_string());
+    };
+
+    let transfer_id = format!("chunk_{}", id);
+    let total_chunks = (base64_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+    log!("Chunking file {} ({} bytes base64) into {} chunks", file_name, base64_data.len(), total_chunks);
+
+    // Send chunk_start
+    let start_msg = json!({
+        "type": "chunk_start",
+        "transferId": transfer_id,
+        "fileName": file_name,
+        "mimeType": mime_type,
+        "totalSize": base64_data.len(),
+        "totalChunks": total_chunks
+    });
+    native_tx.send(start_msg).await.map_err(|e| format!("Failed to send chunk_start: {}", e))?;
+
+    // Send chunks
+    for i in 0..total_chunks {
+        let start = i * CHUNK_SIZE;
+        let end = std::cmp::min(start + CHUNK_SIZE, base64_data.len());
+        let chunk_data = &base64_data[start..end];
+
+        let chunk_msg = json!({
+            "type": "chunk_data",
+            "transferId": transfer_id,
+            "chunkIndex": i,
+            "data": chunk_data
+        });
+        native_tx.send(chunk_msg).await.map_err(|e| format!("Failed to send chunk {}: {}", i, e))?;
+    }
+
+    // Send the actual action with a reference to the chunked transfer
+    if action == "fillForm" {
+        message["params"] = json!({
+            "fields": [{
+                "selector": selector,
+                "file": {
+                    "name": file_name,
+                    "type": mime_type,
+                    "chunkedTransfer": transfer_id
+                }
+            }]
+        });
+    } else if action == "dropFile" {
+        let params = message.get_mut("params").ok_or("Missing params")?;
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("data");
+            obj.insert("chunkedTransfer".to_string(), json!(transfer_id));
+        }
+    }
+
+    Ok(())
+}
+
+/// Process fillForm with filePath in fields - read files before sending
+fn process_fill_form_files(message: &mut Value) -> Result<(), String> {
+    let params = match message.get_mut("params") {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    let fields = match params.get_mut("fields") {
+        Some(Value::Array(f)) => f,
+        _ => return Ok(()),
+    };
+
+    for field in fields.iter_mut() {
+        if let Some(file_path) = field.get("filePath").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+            let path = Path::new(&file_path);
+            let file_data = std::fs::read(path)
+                .map_err(|e| format!("Failed to read file: {}", e))?;
+            let base64_data = base64::engine::general_purpose::STANDARD.encode(&file_data);
+            let file_name = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string();
+            let mime_type = get_mime_type(path);
+
+            field["file"] = json!({
+                "name": file_name,
+                "type": mime_type,
+                "data": base64_data
+            });
+
+            // Remove filePath
+            if let Value::Object(ref mut obj) = field {
+                obj.remove("filePath");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn mask_username(username: &str) -> String {
+    if username.contains('@') {
+        let parts: Vec<&str> = username.splitn(2, '@').collect();
+        let local = parts[0];
+        let domain = parts.get(1).unwrap_or(&"");
+        if local.len() <= 2 {
+            format!("{}***@{}", &local[..1], domain)
+        } else {
+            format!("{}***{}@{}", &local[..1], &local[local.len()-1..], domain)
+        }
+    } else if username.len() <= 3 {
+        format!("{}***", &username[..1])
+    } else {
+        format!("{}***{}", &username[..1], &username[username.len()-1..])
+    }
+}
+
+#[derive(Debug)]
+struct VaultCredential {
+    username: String,
+    password: String,
+    uri: String,
+}
+
+type SharedVault = Arc<RwLock<Option<Vault>>>;
+
+#[deprecated(note = "Use config files instead of gnome-keyring/secret-tool")]
+fn read_secret_tool(service: &str, account: &str) -> Option<String> {
+    let output = std::process::Command::new("secret-tool")
+        .args(["lookup", "service", service, "account", account])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn read_api_credential(name: &str) -> Option<String> {
+    if let Ok(val) = env::var(&format!("BW_{}", name.to_uppercase())) {
+        let val = val.trim().to_string();
+        if !val.is_empty() { return Some(val); }
+    }
+    let config_dir = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+        .join("bronzewarden");
+    if let Ok(val) = std::fs::read_to_string(config_dir.join(name)) {
+        let val = val.trim().to_string();
+        if !val.is_empty() { return Some(val); }
+    }
+    #[allow(deprecated)]
+    if let Some(val) = read_secret_tool("bronzewarden", name) {
+        log!("WARNING: Reading {} from gnome-keyring (deprecated). Use ~/.config/bronzewarden/{} file instead.", name, name);
+        return Some(val);
+    }
+    None
+}
+
+async fn sync_vault_with_api_key() -> Result<(), String> {
+    let client_id = read_api_credential("client_id")
+        .ok_or("No API client_id found. Create ~/.config/bronzewarden/client_id or set BW_CLIENT_ID")?;
+    let client_secret = read_api_credential("client_secret")
+        .ok_or("No API client_secret found. Create ~/.config/bronzewarden/client_secret or set BW_CLIENT_SECRET")?;
+
+    let mut config = BwConfig::load().map_err(|e| format!("Config load: {}", e))?;
+    let api = BitwardenApi::new(&config.identity_url, &config.api_url, &config.device_id);
+
+    let token = api.login_with_api_key(&client_id, &client_secret).await
+        .map_err(|e| format!("API key login: {}", e))?;
+
+    config.access_token = Some(token.access_token.clone());
+    config.refresh_token = token.refresh_token;
+    if let Some(ref key) = token.key {
+        config.encrypted_user_key = Some(key.clone());
+    }
+    if token.kdf.is_some() { config.kdf_type = token.kdf; }
+    if token.kdf_iterations.is_some() { config.kdf_iterations = token.kdf_iterations; }
+    if token.kdf_memory.is_some() { config.kdf_memory = token.kdf_memory; }
+    if token.kdf_parallelism.is_some() { config.kdf_parallelism = token.kdf_parallelism; }
+
+    let sync = api.sync(&token.access_token).await
+        .map_err(|e| format!("Vault sync: {}", e))?;
+
+    if let Some(ref profile_key) = sync.profile.key {
+        config.encrypted_user_key = Some(profile_key.clone());
+    }
+
+    config.save_vault_cache(&sync.ciphers)
+        .map_err(|e| format!("Save cache: {}", e))?;
+    config.save().map_err(|e| format!("Save config: {}", e))?;
+
+    let login_count = sync.ciphers.iter()
+        .filter(|c| c.cipher_type == 1 && c.deleted_date.is_none())
+        .count();
+    log!("Vault synced via API key: {} items ({} logins)", sync.ciphers.len(), login_count);
+    Ok(())
+}
+
+fn vault_status() -> Result<Value, String> {
+    let config = BwConfig::load().map_err(|e| format!("Failed to load config: {}", e))?;
+    let logged_in = config.is_logged_in();
+    let has_cache = BwConfig::load_vault_cache().is_ok();
+    let login_entries = BwConfig::load_vault_cache()
+        .map(|c| c.ciphers.iter().filter(|c| c.cipher_type == 1 && c.deleted_date.is_none()).count())
+        .unwrap_or(0);
+
+    Ok(json!({
+        "locked": !has_cache,
+        "loggedIn": logged_in,
+        "loginEntries": login_entries,
+    }))
+}
+
+fn vault_get_login(vault: &Vault, search: &str) -> Result<VaultCredential, String> {
+    let results = vault.find_by_domain(search);
+    let results = if results.is_empty() {
+        vault.search(search)
+    } else {
+        results
+    };
+
+    if results.is_empty() {
+        return Err(format!("No login found for '{}'", search));
+    }
+
+    let cred = &results[0];
+    Ok(VaultCredential {
+        username: cred.username.clone(),
+        password: cred.password.clone(),
+        uri: cred.uris.first().cloned().unwrap_or_else(|| search.to_string()),
+    })
+}
+
+fn read_password_from_env() -> Option<String> {
+    env::var("BW_PASSWORD")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn read_password_from_file() -> Option<String> {
+    let path = env::var("BW_PASSWORD_FILE").ok()?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[deprecated(note = "Use BW_PASSWORD_FILE instead of secret-tool/keyring")]
+fn read_password_from_secret_tool() -> Option<String> {
+    read_secret_tool("chrome-agent-bridge", "bronzewarden")
+}
+
+fn resolve_bw_password() -> Result<String, String> {
+    if let Some(pw) = read_password_from_env() {
+        return Ok(pw);
+    }
+    if let Some(pw) = read_password_from_file() {
+        return Ok(pw);
+    }
+    #[allow(deprecated)]
+    if let Some(pw) = read_password_from_secret_tool() {
+        log!("WARNING: Reading vault password from gnome-keyring (deprecated). Use BW_PASSWORD_FILE or setup-fingerprint instead.");
+        return Ok(pw);
+    }
+    Err(
+        "No vault password source available. Set BW_PASSWORD_FILE or run `bronzewarden setup-fingerprint`."
+            .to_string(),
+    )
+}
+
+fn unlock_vault_from_sources() -> Result<Vault, String> {
+    let config = BwConfig::load().map_err(|e| format!("Failed to load config: {}", e))?;
+    let email = config.email.as_ref()
+        .ok_or("Not logged in to bronzewarden. Run `bronzewarden login` first.")?;
+    let encrypted_key = config.encrypted_user_key.as_ref()
+        .ok_or("No user key stored. Run `bronzewarden login` first.")?;
+
+    // Try protected key (fingerprint unlock) first
+    let user_key = if bronzewarden::protected_key::has_protected_key() {
+        log!("Using protected key (fingerprint unlock)");
+        bronzewarden::protected_key::load_protected_key()
+            .map_err(|e| format!("Failed to load protected key: {}", e))?
+    } else {
+        // Fall back to password-based unlock
+        let kdf_params = config.kdf_params()
+            .ok_or("No KDF params stored.")?;
+        let password = resolve_bw_password()?;
+        let master_key = MasterKey::derive(&password, email, &kdf_params)
+            .map_err(|e| format!("Key derivation failed: {}", e))?;
+        let stretched = master_key.stretch()
+            .map_err(|e| format!("Key stretch failed: {}", e))?;
+        EncString(encrypted_key.clone()).decrypt_to_key(&stretched)
+            .map_err(|e| format!("Failed to decrypt user key: {}", e))?
+    };
+
+    let cache = BwConfig::load_vault_cache()
+        .map_err(|e| format!("Failed to load vault cache: {}. Run `bronzewarden sync` first.", e))?;
+    let sync = SyncResponse {
+        profile: bronzewarden::api::SyncProfile {
+            id: String::new(),
+            email: config.email.clone(),
+            key: config.encrypted_user_key.clone(),
+            private_key: None,
+        },
+        ciphers: cache.ciphers,
+        folders: None,
+    };
+
+    Ok(Vault::new(user_key, &sync))
+}
+
+async fn ensure_vault_unlocked(vault: &SharedVault) -> Result<(), String> {
+    if vault.read().await.is_some() {
+        return Ok(());
+    }
+
+    let unlocked = tokio::task::spawn_blocking(unlock_vault_from_sources)
+        .await
+        .map_err(|e| format!("Unlock task failed: {}", e))??;
+
+    let mut guard = vault.write().await;
+    if guard.is_none() {
+        *guard = Some(unlocked);
+    }
+    Ok(())
+}
+
+/// Process autoLogin action — query bronzewarden vault and convert to a secure fill sequence.
+/// The password NEVER leaves the native host → extension path (never sent to WebSocket client).
+async fn process_auto_login(
+    message: &Value,
+    native_tx: &NativeTx,
+    pending: &PendingMap,
+    vault: &SharedVault,
+) -> Result<Value, String> {
+    let params = message.get("params").ok_or("Missing params")?;
+    let domain = params.get("domain")
+        .or_else(|| params.get("search"))
+        .or_else(|| params.get("url"))
+        .and_then(|v| v.as_str())
+        .ok_or("autoLogin requires 'domain', 'search', or 'url' parameter")?;
+
+    let search = if domain.starts_with("http") {
+        url::Url::parse(domain)
+            .map(|u| u.host_str().unwrap_or(domain).to_string())
+            .unwrap_or_else(|_| domain.to_string())
+    } else {
+        domain.to_string()
+    };
+
+    let submit = params.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    ensure_vault_unlocked(vault).await?;
+
+    // Look up credential first so we can show context in fingerprint prompt
+    let vault_guard = vault.read().await;
+    let v = vault_guard.as_ref()
+        .ok_or("Vault is not unlocked.")?;
+    let cred = vault_get_login(v, &search)?;
+    drop(vault_guard);
+
+    let masked = mask_username(&cred.username);
+
+    if autologin_require_fingerprint() {
+        let reason = format!("Auto-fill {} on {}", masked, search);
+        let detail = if let Some(caller) = message.get("params")
+            .and_then(|p| p.get("reason"))
+            .and_then(|v| v.as_str()) {
+            format!("Requested by: {}", caller)
+        } else {
+            String::new()
+        };
+        verify_fingerprint(&reason, &detail).await?;
+    }
+
+    let fill_id = next_id();
+    let fill_msg = json!({
+        "action": "secureAutoFill",
+        "id": fill_id,
+        "params": {
+            "username": cred.username,
+            "password": cred.password,
+            "submit": submit
+        }
+    });
+
+    let (response_tx, mut response_rx) = mpsc::channel::<Value>(1);
+    {
+        let mut pending_guard = pending.write().await;
+        pending_guard.insert(fill_id.clone(), PendingRequest {
+            response_tx,
+            started: Instant::now(),
+            profile: false,
+        });
+    }
+
+    native_tx.send(fill_msg).await
+        .map_err(|e| format!("Failed to send fill to browser: {}", e))?;
+
+    let fill_result = match timeout(Duration::from_secs(15), response_rx.recv()).await {
+        Ok(Some(resp)) => resp,
+        Ok(None) => {
+            pending.write().await.remove(&fill_id);
+            return Err("Fill request channel closed".to_string());
+        }
+        Err(_) => {
+            pending.write().await.remove(&fill_id);
+            return Err("Fill request timed out".to_string());
+        }
+    };
+
+    let fill_ok = fill_result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let fill_error = fill_result.get("error").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    if fill_ok {
+        let summary = if submit { "Auto-Login" } else { "Auto-Fill" };
+        let body = format!("{} on {}", masked, search);
+        let _ = tokio::process::Command::new("notify-send")
+            .args(["-i", "dialog-password", "-a", "Chrome Agent Bridge", summary, &body])
+            .spawn();
+    }
+
+    Ok(json!({
+        "autoLogin": true,
+        "filled": fill_ok,
+        "maskedUsername": masked,
+        "matchedUri": cred.uri,
+        "submitted": submit && fill_ok,
+        "error": fill_error,
+    }))
+}
+
+/// Actions that need an active tab to operate on
+fn action_needs_tab(action: &str) -> bool {
+    matches!(
+        action,
+        "navigate" | "click" | "type" | "fillForm" | "getContent"
+            | "getInteractables" | "preexplore" | "screenshot" | "scroll"
+            | "evaluate" | "waitFor" | "tryUntil" | "uploadFile" | "dropFile"
+            | "getAuthContext" | "requestAuth" | "secureAutoFill" | "listFrames"
+    )
+}
+
+/// Handle a WebSocket client connection
+async fn handle_ws_client(
+    stream: tokio::net::TcpStream,
+    native_tx: NativeTx,
+    pending: PendingMap,
+    vault: SharedVault,
+) {
+    let session_id = next_id().replace("req_", "sess_");
+    let mut session = ClientSession {
+        id: session_id.clone(),
+        active_tab_id: None,
+        forks: HashMap::new(),
+    };
+    log!("Session {} connected", session.id);
+
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(128 * 1024 * 1024),
+        max_frame_size: Some(64 * 1024 * 1024),
+        ..Default::default()
+    };
+    let ws_stream = match accept_async_with_config(stream, Some(ws_config)).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            log!("WebSocket handshake error: {}", e);
+            return;
+        }
+    };
+
+    let (mut write, mut read) = ws_stream.split();
+
+    // Send ready message with session ID
+    let ready_msg = json!({
+        "type": "ready",
+        "host": ws_host(),
+        "port": ws_port(),
+        "sessionId": session.id
+    });
+    if let Err(e) = write.send(Message::Text(ready_msg.to_string())).await {
+        log!("Failed to send ready message: {}", e);
+        return;
+    }
+
+    while let Some(msg) = read.next().await {
+        let msg = match msg {
+            Ok(Message::Text(text)) => text,
+            Ok(Message::Close(_)) => break,
+            Ok(_) => continue,
+            Err(e) => {
+                log!("WebSocket read error: {}", e);
+                break;
+            }
+        };
+
+        let mut message: Value = match serde_json::from_str(&msg) {
+            Ok(m) => m,
+            Err(_) => {
+                let error_msg = json!({"ok": false, "error": "Invalid JSON"});
+                let _ = write.send(Message::Text(error_msg.to_string())).await;
+                continue;
+            }
+        };
+
+        // Handle session control messages
+        if let Some(msg_type) = message.get("type").and_then(|v| v.as_str()) {
+            if msg_type == "session_info" {
+                let info = json!({
+                    "type": "session_info",
+                    "sessionId": session.id,
+                    "activeTabId": session.active_tab_id,
+                    "forks": session.forks.keys().collect::<Vec<_>>()
+                });
+                let _ = write.send(Message::Text(info.to_string())).await;
+                continue;
+            }
+        }
+
+        if message.get("action").is_none() {
+            let error_msg = json!({"ok": false, "error": "Missing action"});
+            let _ = write.send(Message::Text(error_msg.to_string())).await;
+            continue;
+        }
+
+        let id = match message.get("id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => {
+                let id = next_id();
+                message["id"] = json!(id);
+                id
+            }
+        };
+
+        let action = message.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // Session-scoped tab injection: if the message doesn't have an explicit
+        // tabId and the action needs a tab, inject the session's active tab.
+        if action_needs_tab(&action) {
+            let has_explicit_tab = message.get("params")
+                .and_then(|p| p.get("tabId"))
+                .and_then(|v| v.as_i64())
+                .is_some();
+            if !has_explicit_tab {
+                if let Some(tab_id) = session.active_tab_id {
+                    if let Some(params) = message.get_mut("params") {
+                        params["tabId"] = json!(tab_id);
+                    } else {
+                        message["params"] = json!({"tabId": tab_id});
+                    }
+                }
+            }
+        }
+
+        // Session-scoped fork resolution: resolve fork names within this session
+        if let Some(fork_name) = message.get("params").and_then(|p| p.get("fork")).and_then(|v| v.as_str()).map(|s| s.to_string()) {
+            if let Some(&tab_id) = session.forks.get(&fork_name) {
+                if let Some(params) = message.get_mut("params") {
+                    params["tabId"] = json!(tab_id);
+                }
+            }
+        }
+
+        let profile = message.get("profile").and_then(|v| v.as_bool()).unwrap_or(false)
+            || message.get("params")
+                .and_then(|p| p.get("profile"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+        let started = Instant::now();
+
+        // Hard policy gate: configureAuth is not allowed via agent-facing API.
+        if message.get("action").and_then(|v| v.as_str()) == Some("configureAuth") {
+            let error_msg = json!({
+                "id": id,
+                "ok": false,
+                "error": "configureAuth is not supported by this host build."
+            });
+            let _ = write.send(Message::Text(error_msg.to_string())).await;
+            continue;
+        }
+
+        // Handle uploadFile action
+        if message.get("action").and_then(|v| v.as_str()) == Some("uploadFile") {
+            if let Err(e) = process_upload_file(&mut message) {
+                let error_msg = json!({"id": id, "ok": false, "error": e});
+                let _ = write.send(Message::Text(error_msg.to_string())).await;
+                continue;
+            }
+        }
+
+        // Handle fillForm with filePath in fields
+        if message.get("action").and_then(|v| v.as_str()) == Some("fillForm") {
+            if let Err(e) = process_fill_form_files(&mut message) {
+                let error_msg = json!({"id": id, "ok": false, "error": e});
+                let _ = write.send(Message::Text(error_msg.to_string())).await;
+                continue;
+            }
+        }
+
+        // Handle autoLogin — intercepted entirely by native host, credentials never sent to WS client
+        if message.get("action").and_then(|v| v.as_str()) == Some("autoLogin") {
+            match process_auto_login(&message, &native_tx, &pending, &vault).await {
+                Ok(result) => {
+                    let response = json!({"id": id, "ok": true, "result": result});
+                    let _ = write.send(Message::Text(response.to_string())).await;
+                }
+                Err(e) => {
+                    let error_msg = json!({"id": id, "ok": false, "error": e});
+                    let _ = write.send(Message::Text(error_msg.to_string())).await;
+                }
+            }
+            continue;
+        }
+
+        // Handle vaultStatus — check bronzewarden state without exposing secrets
+        if message.get("action").and_then(|v| v.as_str()) == Some("vaultStatus") {
+            let _ = ensure_vault_unlocked(&vault).await;
+            let vault_unlocked = vault.read().await.is_some();
+            let status_result = tokio::task::spawn_blocking(vault_status).await;
+            let status_result = match status_result {
+                Ok(inner) => inner,
+                Err(e) => Err(format!("Task failed: {}", e)),
+            };
+            match status_result {
+                Ok(mut status) => {
+                    status["locked"] = json!(!vault_unlocked);
+                    let response = json!({
+                        "id": id,
+                        "ok": true,
+                        "result": {
+                            "locked": status.get("locked").and_then(|v| v.as_bool()).unwrap_or(true),
+                            "loggedIn": status.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false),
+                            "loginEntries": status.get("loginEntries").and_then(|v| v.as_u64()).unwrap_or(0),
+                        }
+                    });
+                    let _ = write.send(Message::Text(response.to_string())).await;
+                }
+                Err(e) => {
+                    let error_msg = json!({"id": id, "ok": false, "error": e});
+                    let _ = write.send(Message::Text(error_msg.to_string())).await;
+                }
+            }
+            continue;
+        }
+
+        // Handle vaultSync — re-sync vault via API key and re-unlock
+        if message.get("action").and_then(|v| v.as_str()) == Some("vaultSync") {
+            let vault_clone = vault.clone();
+            let sync_result = async {
+                sync_vault_with_api_key().await?;
+                // Clear cached vault so it re-unlocks with fresh data
+                *vault_clone.write().await = None;
+                ensure_vault_unlocked(&vault_clone).await?;
+                let count = vault_clone.read().await.as_ref()
+                    .map(|v| v.login_count()).unwrap_or(0);
+                Ok::<_, String>(count)
+            }.await;
+
+            match sync_result {
+                Ok(count) => {
+                    let response = json!({"id": id, "ok": true, "result": {"synced": true, "loginEntries": count}});
+                    let _ = write.send(Message::Text(response.to_string())).await;
+                }
+                Err(e) => {
+                    let error_msg = json!({"id": id, "ok": false, "error": e});
+                    let _ = write.send(Message::Text(error_msg.to_string())).await;
+                }
+            }
+            continue;
+        }
+
+        // Create response channel for this request
+        let (response_tx, mut response_rx) = mpsc::channel::<Value>(1);
+
+        // Register pending request
+        {
+            let mut pending_guard = pending.write().await;
+            pending_guard.insert(id.clone(), PendingRequest {
+                response_tx,
+                started,
+                profile,
+            });
+        }
+
+        // Send to native messaging (with chunking for large payloads)
+        if needs_chunking(&message) {
+            if let Err(e) = send_chunked_file(&mut message, &native_tx).await {
+                log!("Failed to chunk file: {}", e);
+                pending.write().await.remove(&id);
+                let error_msg = json!({"id": id, "ok": false, "error": format!("Failed to chunk file: {}", e)});
+                let _ = write.send(Message::Text(error_msg.to_string())).await;
+                continue;
+            }
+        }
+        if let Err(e) = native_tx.send(message).await {
+            log!("Failed to send to native: {}", e);
+            pending.write().await.remove(&id);
+            let error_msg = json!({"id": id, "ok": false, "error": "Failed to send to browser"});
+            let _ = write.send(Message::Text(error_msg.to_string())).await;
+            continue;
+        }
+
+        // Wait for response with timeout
+        let timeout_ms = request_timeout_ms();
+        let response = match timeout(Duration::from_millis(timeout_ms), response_rx.recv()).await {
+            Ok(Some(resp)) => resp,
+            Ok(None) => {
+                pending.write().await.remove(&id);
+                let mut error_msg = json!({"id": id, "ok": false, "error": "Request channel closed"});
+                if profile {
+                    let host_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    error_msg["timing"] = json!({"hostMs": (host_ms * 100.0).round() / 100.0});
+                }
+                let _ = write.send(Message::Text(error_msg.to_string())).await;
+                continue;
+            }
+            Err(_) => {
+                pending.write().await.remove(&id);
+                let mut error_msg = json!({"id": id, "ok": false, "error": "Request timed out"});
+                if profile {
+                    let host_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    error_msg["timing"] = json!({"hostMs": (host_ms * 100.0).round() / 100.0});
+                }
+                let _ = write.send(Message::Text(error_msg.to_string())).await;
+                continue;
+            }
+        };
+
+        // Update session state from responses
+        let resp_ok = response.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if resp_ok {
+            if let Some(result) = response.get("result") {
+                // Track tabId from navigate, newSession, setActiveTab responses
+                if matches!(action.as_str(), "navigate" | "newSession" | "setActiveTab") {
+                    if let Some(tab_id) = result.get("tabId").and_then(|v| v.as_i64()) {
+                        session.active_tab_id = Some(tab_id);
+                    }
+                }
+                // Track forks created by this session
+                if action == "fork" {
+                    if let Some(forks) = result.get("forks").and_then(|v| v.as_array()) {
+                        for fork in forks {
+                            if let (Some(name), Some(tab_id)) = (
+                                fork.get("name").and_then(|v| v.as_str()),
+                                fork.get("tabId").and_then(|v| v.as_i64()),
+                            ) {
+                                session.forks.insert(name.to_string(), tab_id);
+                            }
+                        }
+                    }
+                }
+                // Track fork deletion
+                if action == "killFork" {
+                    if let Some(killed) = result.get("fork").and_then(|v| v.as_str()) {
+                        session.forks.remove(killed);
+                    }
+                }
+            }
+        }
+
+        // Send response back to client
+        if let Err(e) = write.send(Message::Text(response.to_string())).await {
+            log!("Failed to send response: {}", e);
+            break;
+        }
+    }
+
+    log!("Session {} disconnected (tab: {:?})", session.id, session.active_tab_id);
+}
+
+/// Read native messaging input from stdin (blocking, runs in separate thread)
+fn read_native_stdin(tx: mpsc::Sender<Value>) {
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let mut len_buf = [0u8; 4];
+
+    loop {
+        // Read 4-byte length prefix (little-endian)
+        if stdin.read_exact(&mut len_buf).is_err() {
+            log!("Native messaging stream ended");
+            break;
+        }
+
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > 100 * 1024 * 1024 {
+            log!("Invalid message length: {}", len);
+            continue;
+        }
+
+        // Read message body
+        let mut msg_buf = vec![0u8; len];
+        if stdin.read_exact(&mut msg_buf).is_err() {
+            log!("Failed to read message body");
+            continue;
+        }
+
+        // Parse JSON
+        let message: Value = match serde_json::from_slice(&msg_buf) {
+            Ok(m) => m,
+            Err(e) => {
+                log!("Failed to parse native message: {}", e);
+                continue;
+            }
+        };
+
+        // Send to async handler
+        if tx.blocking_send(message).is_err() {
+            log!("Failed to send native message to handler");
+            break;
+        }
+    }
+}
+
+/// Write native messaging output to stdout
+fn write_native_stdout(message: &Value) {
+    let payload = message.to_string();
+    let payload_bytes = payload.as_bytes();
+    let len = payload_bytes.len() as u32;
+    let len_bytes = len.to_le_bytes();
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+
+    if stdout.write_all(&len_bytes).is_err() {
+        log!("Failed to write message length");
+        return;
+    }
+    if stdout.write_all(payload_bytes).is_err() {
+        log!("Failed to write message body");
+        return;
+    }
+    if stdout.flush().is_err() {
+        log!("Failed to flush stdout");
+    }
+}
+
+/// Process messages from the browser extension
+async fn handle_native_messages(
+    mut native_rx: mpsc::Receiver<Value>,
+    pending: PendingMap,
+) {
+    while let Some(mut message) = native_rx.recv().await {
+        // Check if this is a response to a pending request
+        if let Some(id) = message.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+            let entry = pending.write().await.remove(&id);
+            if let Some(req) = entry {
+                // Add timing if profiling
+                if req.profile {
+                    let host_ms = req.started.elapsed().as_secs_f64() * 1000.0;
+                    let timing = message.get("timing")
+                        .and_then(|t| t.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut timing_obj = timing;
+                    timing_obj.insert("hostMs".to_string(), json!((host_ms * 100.0).round() / 100.0));
+                    message["timing"] = json!(timing_obj);
+                }
+
+                // Send response back to the WebSocket client
+                let _ = req.response_tx.send(message).await;
+                continue;
+            }
+        }
+
+        // Not a response - this is an event, broadcast to all clients
+        // (For now we just log it, as we don't track all connected clients for broadcasting)
+        log!("Received event from browser: {}", message);
+    }
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() {
+    let host = ws_host();
+    let port = ws_port();
+    let addr = format!("{}:{}", host, port);
+
+    // Try to unlock the bronzewarden vault at startup
+    let vault: SharedVault = Arc::new(RwLock::new(None));
+    match unlock_vault_from_sources() {
+        Ok(v) => {
+            log!("Bronzewarden vault unlocked ({} logins)", v.login_count());
+            *vault.write().await = Some(v);
+        }
+        Err(e) => {
+            log!("Vault not unlocked at startup (will retry on demand): {}", e);
+        }
+    }
+
+    // Create pending request map
+    let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
+
+    // Create channel for outgoing native messages
+    let (native_out_tx, mut native_out_rx) = mpsc::channel::<Value>(100);
+
+    // Create channel for incoming native messages
+    let (native_in_tx, native_in_rx) = mpsc::channel::<Value>(100);
+
+    // Spawn thread for reading native stdin (blocking I/O)
+    let stdin_tx = native_in_tx.clone();
+    std::thread::spawn(move || {
+        read_native_stdin(stdin_tx);
+        std::process::exit(0);
+    });
+
+    // Spawn task for writing to native stdout
+    tokio::spawn(async move {
+        while let Some(message) = native_out_rx.recv().await {
+            write_native_stdout(&message);
+        }
+    });
+
+    // Spawn task for handling incoming native messages
+    let pending_clone = pending.clone();
+    tokio::spawn(async move {
+        handle_native_messages(native_in_rx, pending_clone).await;
+    });
+
+    // Start WebSocket server
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            log!("Failed to bind to {}: {}", addr, e);
+            std::process::exit(1);
+        }
+    };
+
+    log!("WebSocket server listening on ws://{}", addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let native_tx = native_out_tx.clone();
+                let pending_clone = pending.clone();
+                let vault_clone = vault.clone();
+                tokio::spawn(async move {
+                    handle_ws_client(stream, native_tx, pending_clone, vault_clone).await;
+                });
+            }
+            Err(e) => {
+                log!("Failed to accept connection: {}", e);
+            }
+        }
+    }
+}

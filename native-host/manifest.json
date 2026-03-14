@@ -1,0 +1,7 @@
+{
+  "name": "chrome_agent_bridge",
+  "description": "Native host for Chrome Agent Bridge",
+  "path": "__HOST_PATH__",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://__CHROME_EXTENSION_ID__/"]
+}

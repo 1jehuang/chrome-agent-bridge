@@ -1,0 +1,51 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Agent Bridge",
+  "version": "1.0.0",
+  "description": "Let AI coding agents control your Chrome browser. Navigate, click, type, screenshot, and automate tasks via native messaging.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "nativeMessaging",
+    "notifications",
+    "storage",
+    "webNavigation",
+    "webRequest",
+    "downloads",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    },
+    "default_title": "Chrome Agent Bridge - Idle",
+    "default_popup": "popup.html"
+  },
+  "externally_connectable": {
+    "matches": ["*://localhost/*"]
+  },
+  "minimum_chrome_version": "116"
+}
