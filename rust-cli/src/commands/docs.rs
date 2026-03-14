@@ -2,14 +2,13 @@ use crate::config::VERSION;
 
 /// Print short help message
 pub fn print_help() {
-    let help = format!(
-        r##"
-chrome-agent-bridge v{}
+    let help = r##"
+chrome-agent-bridge v__VERSION__
 Control Chrome browser from LLM agents
 
 USAGE:
-  browser <action> [params_json]
-  browser <command>
+  chrome-browser <action> [params_json]
+  chrome-browser <command>
 
 COMMANDS:
   help, --help      Show this help
@@ -20,26 +19,24 @@ COMMANDS:
 
 ACTIONS:
   Session:     listTabs, newSession, setActiveTab, getActiveTab
-  Navigation:  navigate, getContent, getInteractables, screenshot
+  Navigation:  navigate, getContent, getInteractables, screenshot, evaluate, scroll
   Interaction: click, type, fillForm, waitFor
   Control:     fork, killFork, listForks, tryUntil, parallel
-  Auth:        getAuthContext, requestAuth
+  Auth:        getAuthContext, requestAuth, listFrames
   Utility:     ping
 
 EXAMPLES:
-  browser ping
-  browser newSession '{{"url": "https://example.com"}}'
-  browser click '{{"selector": "#btn"}}'
-  browser getContent '{{"format": "annotated"}}'
+  chrome-browser ping
+  chrome-browser newSession '{"url": "https://example.com"}'
+  chrome-browser click '{"selector": "#btn"}'
+  chrome-browser getContent '{"format": "annotated"}'
 
 QUICK START:
   1. Install Chrome extension from extension/ folder
-  2. browser ping                    # verify connection
-  3. browser newSession '{{"url": "https://google.com"}}'
-  4. browser click '{{"text": "Sign in"}}'
-"##,
-        VERSION
-    );
+  2. chrome-browser ping                    # verify connection
+  3. chrome-browser newSession '{"url": "https://google.com"}'
+  4. chrome-browser click '{"text": "Sign in"}'
+"##.replace("__VERSION__", VERSION);
     println!("{}", help);
 }
 
@@ -64,6 +61,8 @@ Control Chrome browser via WebSocket. Uses real browser with existing logins.
 - getContent        Get page content (format: annotated, text, html)
 - getInteractables  List clickable elements
 - screenshot        Capture visible area
+- evaluate          Execute JavaScript in the page main world
+- scroll            Scroll page by x/y delta
 
 ### Interaction
 - click             Click element (selector, text, or x/y)
@@ -76,7 +75,7 @@ Control Chrome browser via WebSocket. Uses real browser with existing logins.
 Fill form fields including text inputs, textareas, and <select> dropdowns:
 
 ```
-browser fillForm '{"fields": [
+chrome-browser fillForm '{"fields": [
   {"selector": "#name", "value": "John Doe"},
   {"selector": "#email", "value": "john@example.com"},
   {"selector": "#subject", "value": "support"},
@@ -107,13 +106,13 @@ getContent supports:
 ## Fork Example
 
 ```
-browser fork '{"paths": [
+chrome-browser fork '{"paths": [
   {"name": "path-a", "commands": [{"action": "click", "params": {"text": "Option A"}}]},
   {"name": "path-b", "commands": [{"action": "click", "params": {"text": "Option B"}}]}
 ]}'
 
-browser click '{"text": "Continue", "fork": "path-a"}'
-browser killFork '{"fork": "path-b"}'
+chrome-browser click '{"text": "Continue", "fork": "path-a"}'
+chrome-browser killFork '{"fork": "path-b"}'
 ```
 
 ## Sandbox Mode
@@ -121,7 +120,7 @@ browser killFork '{"fork": "path-b"}'
 For reproducible testing without cached logins:
 
 ```
-browser newSession '{"url": "https://example.com", "sandbox": true}'
+chrome-browser newSession '{"url": "https://example.com", "sandbox": true}'
 ```
 
 This opens a private window with no cookies or cached data.

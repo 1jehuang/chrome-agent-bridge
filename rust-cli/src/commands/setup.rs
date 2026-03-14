@@ -36,14 +36,14 @@ fn setup_claude() -> Result<()> {
 
     // Update SKILL.md to use 'browser' command instead of client.js path
     let updated_skill_md = SKILL_MD
-        .replace("node ~/.claude/skills/chrome-browser/client.js", "browser")
-        .replace("client.js", "browser");
+        .replace("node ~/.claude/skills/chrome-browser/client.js", "chrome-browser")
+        .replace("client.js", "chrome-browser");
 
     fs::write(&skill_md_path, updated_skill_md)?;
     println!("Created SKILL.md at {}", skill_md_path.display());
 
     println!("Claude Code skill installed at {}", skill_dir.display());
-    println!("\nClaude Code will now recognize the \"browser\" command.");
+    println!("\nClaude Code will now recognize the \"chrome-browser\" command.");
 
     Ok(())
 }

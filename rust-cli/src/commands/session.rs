@@ -73,7 +73,7 @@ pub async fn run(name: &str) -> Result<()> {
 
     let (ws_stream, _) = connect_async(WS_URL).await.map_err(|e| {
         anyhow!(
-            "WebSocket error: {}\nIs Chrome running with the Browser Agent Bridge extension?",
+            "WebSocket error: {}\nIs Chrome running with the Chrome Agent Bridge extension?", 
             e
         )
     })?;

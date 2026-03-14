@@ -10,15 +10,11 @@ keywords = ["chrome", "browser", "automation", "agent", "websocket"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "browser"
+name = "chrome-browser"
 path = "src/main.rs"
 
 [[bin]]
 name = "chrome-agent-bridge-host"
-path = "src/bin/host.rs"
-
-[[bin]]
-name = "firefox-agent-bridge-host"
 path = "src/bin/host.rs"
 
 [dependencies]
@@ -47,9 +43,6 @@ anyhow = "1"
 # Platform-specific home directory
 dirs = "5"
 
-# Vault credential lookup
-bronzewarden = { path = "../../projects/bronzewarden" }
-rpassword = "7"
 
 [dev-dependencies]
 tempfile = "3"

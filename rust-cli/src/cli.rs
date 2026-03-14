@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "browser",
+    name = "chrome-browser",
     version,
     about = "Control Chrome browser from LLM agents via WebSocket",
     long_about = None

@@ -28,7 +28,7 @@ cd rust-cli
 cargo build --release
 
 # Install the CLI
-cp target/release/browser ~/.local/bin/chrome-browser
+cp target/release/chrome-browser ~/.local/bin/
 
 # Install the native messaging host
 cp target/release/chrome-agent-bridge-host ~/.local/bin/
@@ -54,18 +54,14 @@ chrome-browser click '{"selector": "..."}'   # Click element
 chrome-browser type '{"selector": "...", "text": "..."}'  # Type into input
 chrome-browser fillForm '{"fields": [...]}'  # Fill form fields
 chrome-browser screenshot '{}'               # Capture page
-chrome-browser eval '{"code": "..."}'        # Run JavaScript
-chrome-browser getUrl                        # Get current URL
-chrome-browser getTabs                       # List open tabs
-chrome-browser switchTab '{"tabId": 123}'    # Switch to tab
-chrome-browser scroll '{"direction": "down"}'  # Scroll page
-chrome-browser hover '{"selector": "..."}'   # Hover over element
-chrome-browser select '{"selector": "...", "value": "..."}' # Select dropdown
-chrome-browser waitForElement '{"selector": "..."}' # Wait for element
+chrome-browser evaluate '{"script": "return document.title"}' # Run JavaScript in page context
+chrome-browser listTabs '{}'                 # List open tabs
+chrome-browser newSession '{"url": "https://example.com"}'   # Open a new working tab
+chrome-browser setActiveTab '{"tabId": 123, "focus": true}' # Switch active tab
+chrome-browser scroll '{"y": 500}'          # Scroll page by pixels
+chrome-browser waitFor '{"selector": "..."}' # Wait for element
 chrome-browser uploadFile '{"selector": "...", "path": "..."}' # Upload file
-chrome-browser back                          # Go back
-chrome-browser forward                       # Go forward
-chrome-browser reload                        # Reload page
+chrome-browser reload                        # Reload extension
 ```
 
 ## For AI Agents

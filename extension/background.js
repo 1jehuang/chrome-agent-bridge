@@ -135,11 +135,11 @@ function updateBadge() {
   if (activeRequests > 0) {
     chrome.action.setBadgeText({ text: "AI" });
     chrome.action.setBadgeBackgroundColor({ color: "#4ade80" });
-    chrome.action.setTitle({ title: "Browser Agent Bridge - AI Active" });
+    chrome.action.setTitle({ title: "Chrome Agent Bridge - AI Active" });
   } else if (!isConnected) {
     chrome.action.setBadgeText({ text: "!" });
     chrome.action.setBadgeBackgroundColor({ color: "#ef4444" });
-    chrome.action.setTitle({ title: "Browser Agent Bridge - Disconnected" });
+    chrome.action.setTitle({ title: "Chrome Agent Bridge - Disconnected" });
   } else {
     chrome.action.setBadgeText({ text: "" });
     chrome.action.setTitle({ title: "Chrome Agent Bridge - Idle" });

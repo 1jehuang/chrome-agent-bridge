@@ -33,7 +33,7 @@ pub async fn send_command_timed(action: &str, params: Value) -> Result<TimedResp
     // Connect to WebSocket
     let (ws_stream, _) = connect_async(WS_URL).await.map_err(|e| {
         anyhow!(
-            "WebSocket error: {}\nIs Chrome running with the Browser Agent Bridge extension enabled?",
+            "WebSocket error: {}\nIs Chrome running with the Chrome Agent Bridge extension enabled?", 
             e
         )
     })?;
