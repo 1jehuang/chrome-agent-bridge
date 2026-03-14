@@ -1566,8 +1566,8 @@ async function handleSecureAutoFill(params) {
   return filled;
 }
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (!message || message.type !== "agent-bridge") return undefined;
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || message.type !== "agent-bridge") return false;
   const params = message.params || {};
   const profile = Boolean(message.profile || params.profile);
   const started = profile ? performance.now() : 0;
@@ -1585,7 +1585,7 @@ chrome.runtime.onMessage.addListener((message) => {
       case "fillForm":
         return handleFillForm(params);
       case "tryUntil":
-      case "branch":  // Legacy alias
+      case "branch":
         return handleTryUntil(params);
       case "getInteractables":
         return handleGetInteractables(params);
@@ -1608,13 +1608,18 @@ chrome.runtime.onMessage.addListener((message) => {
     }
   };
 
-  return run().then((result) => {
-    if (!profile) return result;
+  run().then((result) => {
+    if (!profile) { sendResponse(result); return; }
     const timing = { contentMs: roundMs(performance.now() - started) };
     if (result && typeof result === "object") {
       result.__timing = timing;
-      return result;
+      sendResponse(result);
+      return;
     }
-    return { value: result, __timing: timing };
+    sendResponse({ value: result, __timing: timing });
+  }).catch((err) => {
+    sendResponse({ error: err.message || String(err) });
   });
+
+  return true;
 });
